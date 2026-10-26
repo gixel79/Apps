@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1220">
+<title>Voce Live</title>
+<style>
+:root{
+  --bg:#0f1220; --card:#1b2038; --ink:#eef1ff; --mute:#8f98c4;
+  --cyan:#34e0f2; --red:#ff4b4b; --lime:#c6ff3d; --on:#0f1220;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#eef1ff; --card:#dde2f8; --ink:#171b34; --mute:#505a8a; --cyan:#0a7f92; --red:#d42b2b; --lime:#3f7d00; --on:#fff; }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS","Segoe UI",Roboto,sans-serif;
+  -webkit-user-select:none;user-select:none}
+body{max-width:560px;margin:0 auto;padding:14px 14px 28px}
+h1{margin:4px 0 12px;font-size:26px;font-weight:800;text-align:center}
+h1 span{color:var(--cyan)}
+#go{display:block;width:100%;border:0;border-radius:16px;padding:18px;font:inherit;font-size:18px;font-weight:800;
+  background:var(--cyan);color:var(--on)}
+#go.live{background:var(--red);color:#fff}
+#meter{height:10px;border-radius:5px;background:var(--card);margin:12px 0 6px;overflow:hidden}
+#bar{height:100%;width:0;background:var(--lime);transition:width .06s linear}
+#info{font-size:13px;color:var(--mute);text-align:center;min-height:36px;padding:0 4px}
+#msg{font-size:14px;color:var(--cyan);text-align:center;min-height:36px;padding:0 4px}
+h2{font-size:15px;margin:14px 2px 8px;color:var(--mute);font-weight:700}
+#fx{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.fx{background:var(--card);color:var(--ink);border:2px solid transparent;border-radius:14px;padding:12px 4px;
+  font:inherit;font-size:13px;font-weight:700;display:flex;flex-direction:column;align-items:center;gap:4px}
+.fx i{font-style:normal;font-size:26px;line-height:1}
+.fx.sel{border-color:var(--cyan)}
+.fx:active{filter:brightness(1.25)}
+.sl{display:grid;grid-template-columns:70px 1fr 52px;align-items:center;gap:8px;font-size:13px;color:var(--mute);margin-top:6px}
+.sl output{text-align:right;color:var(--cyan)}
+input[type=range]{width:100%;height:30px;accent-color:var(--cyan)}
+</style>
+</head>
+<body>
+<h1>Voce <span>Live</span></h1>
+<button id="go" type="button">Avvia microfono</button>
+<div id="meter"><div id="bar"></div></div>
+<div id="info">Usa le cuffie, meglio se con filo: senza cuffie si crea fischio e con il Bluetooth la latenza aumenta.</div>
+<div id="msg" aria-live="polite"></div>
+
+<h2>Effetto in diretta</h2>
+<div id="fx"></div>
+<div class="sl"><label for="tone">Tono</label><input id="tone" type="range" min="-12" max="12" step="1" value="0"><output id="toneO">0</output></div>
+<div class="sl"><label for="vol">Volume</label><input id="vol" type="range" min="0" max="1.5" step="0.05" value="1"><output id="volO">1.0</output></div>
+
+<script>
+(function(){
+"use strict";
+var AC=window.AudioContext||window.webkitAudioContext;
+var $=function(id){return document.getElementById(id);};
+var ctx=null, stream=null, mic=null, ana=null, master=null, pitchIn, pitchOut, byp, act, taps=[], pLfoG;
+var cur=null, reg=[], fxI=0, T=0.08, raf=0, live=false;
+
+function msg(t){$("msg").textContent=t;}
+function curve(k){var n=256,a=new Float32Array(n);for(var i=0;i<n;i++){var x=i*2/n-1;a[i]=(1+k)*x/(1+k*Math.abs(x));}return a;}
+function impulse(c,sec,pw){var n=Math.floor(c.sampleRate*sec),b=c.createBuffer(2,n,c.sampleRate);
+  for(var ch=0;ch<2;ch++){var d=b.getChannelData(ch);for(var i=0;i<n;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/n,pw);}return b;}
+function filt(c,type,f,q){var b=c.createBiquadFilter();b.type=type;b.frequency.value=f;if(q)b.Q.value=q;return b;}
+function lfo(c,rate,depth,target){var o=c.createOscillator(),g=c.createGain();o.frequency.value=rate;g.gain.value=depth;o.connect(g);g.connect(target);o.start();reg.push(o);}
+function vibrato(c,n,rate,depth,baseT){var d=c.createDelay(1);d.delayTime.value=baseT;lfo(c,rate,depth,d.delayTime);n.connect(d);return d;}
+function echo(c,n,time,fb,wet){var sum=c.createGain(),d=c.createDelay(2),f=c.createGain(),w=c.createGain();
+  d.delayTime.value=time;f.gain.value=fb;w.gain.value=wet;n.connect(sum);n.connect(d);d.connect(f);f.connect(d);d.connect(w);w.connect(sum);return sum;}
+function ring(c,n,freq){var g=c.createGain();g.gain.value=0;var o=c.createOscillator();o.frequency.value=freq;o.connect(g.gain);o.start();reg.push(o);n.connect(g);return g;}
+function shaper(c,n,k){var w=c.createWaveShaper();w.curve=curve(k);n.connect(w);return w;}
+function chain(a,b){a.connect(b);return b;}
+
+var FX=[
+ {n:"Normale",e:"🎤",build:function(c,s){return s;}},
+ {n:"Scoiattolo",e:"🐿️",r:1.7,build:function(c,s){return s;}},
+ {n:"Mostro",e:"👹",r:0.62,build:function(c,s){var g=c.createGain();g.gain.value=1.3;return chain(shaper(c,chain(s,filt(c,"lowpass",3000)),6),g);}},
+ {n:"Robot",e:"🤖",build:function(c,s){return ring(c,s,60);}},
+ {n:"Alieno",e:"👽",build:function(c,s){return vibrato(c,ring(c,s,190),9,0.004,0.01);}},
+ {n:"Eco",e:"🏔️",build:function(c,s){return echo(c,s,0.25,0.45,0.6);}},
+ {n:"Caverna",e:"🕳️",build:function(c,s){var sum=c.createGain(),cv=c.createConvolver(),w=c.createGain();cv.buffer=impulse(c,2.5,2.5);w.gain.value=0.9;
+   s.connect(sum);s.connect(cv);cv.connect(w);w.connect(sum);return sum;}},
+ {n:"Telefono",e:"📞",build:function(c,s){var g=c.createGain();g.gain.value=1.6;return chain(shaper(c,chain(chain(s,filt(c,"highpass",500)),filt(c,"lowpass",3200)),3),g);}},
+ {n:"Megafono",e:"📢",build:function(c,s){var g=c.createGain();g.gain.value=1.3;
+   return echo(c,chain(shaper(c,chain(chain(s,filt(c,"highpass",700)),filt(c,"lowpass",3500)),12),g),0.09,0.3,0.4);}},
+ {n:"Sott’acqua",e:"🫧",build:function(c,s){var g=c.createGain();g.gain.value=1.8;return chain(vibrato(c,chain(s,filt(c,"lowpass",650,2)),3.5,0.006,0.012),g);}},
+ {n:"Ubriaco",e:"🥴",r:0.9,mod:true,build:function(c,s){return s;}},
+ {n:"Tremante",e:"😱",build:function(c,s){var g=c.createGain();g.gain.value=0.5;lfo(c,11,0.5,g.gain);s.connect(g);return g;}}
+];
+
+// Cambio di tono in tempo reale: due linee di ritardo con rampa e finestra incrociate
+function buildPitch(){
+  var n=Math.round(T*ctx.sampleRate), rb=ctx.createBuffer(1,n,ctx.sampleRate), wb=ctx.createBuffer(1,n,ctx.sampleRate);
+  var r=rb.getChannelData(0), w=wb.getChannelData(0);
+  for(var i=0;i<n;i++){r[i]=i/n;var s=Math.sin(Math.PI*i/n);w[i]=s*s;}
+  pitchIn=ctx.createGain();pitchOut=ctx.createGain();byp=ctx.createGain();act=ctx.createGain();act.gain.value=0;
+  pitchIn.connect(byp);byp.connect(pitchOut);act.connect(pitchOut);
+  var pl=ctx.createOscillator();pl.frequency.value=1.3;pLfoG=ctx.createGain();pLfoG.gain.value=0;pl.connect(pLfoG);pl.start();
+  var t0=ctx.currentTime+0.05;
+  taps=[];
+  for(var k=0;k<2;k++){
+    var d=ctx.createDelay(0.5);d.delayTime.value=0;
+    var g=ctx.createGain();g.gain.value=0;pLfoG.connect(g.gain);
+    var rs=ctx.createBufferSource();rs.buffer=rb;rs.loop=true;rs.connect(g);g.connect(d.delayTime);
+    var wg=ctx.createGain();wg.gain.value=0;
+    var ws=ctx.createBufferSource();ws.buffer=wb;ws.loop=true;ws.connect(wg.gain);
+    pitchIn.connect(d);d.connect(wg);wg.connect(act);
+    rs.start(t0,k*T/2);ws.start(t0,k*T/2);
+    taps.push({d:d,g:g});
+  }
+}
+function setPitch(ratio,mod){
+  var t=ctx.currentTime;
+  if(Math.abs(ratio-1)<0.002&&!mod){byp.gain.setTargetAtTime(1,t,0.02);act.gain.setTargetAtTime(0,t,0.02);pLfoG.gain.value=0;return;}
+  var G=(1-ratio)*T, base=(G<0?-G:0)+(mod?0.02:0);
+  taps.forEach(function(x){x.g.gain.setTargetAtTime(G,t,0.02);x.d.delayTime.setTargetAtTime(base,t,0.02);});
+  pLfoG.gain.value=mod?0.02:0;
+  byp.gain.setTargetAtTime(0,t,0.02);act.gain.setTargetAtTime(1,t,0.02);
+}
+function ratioNow(){var f=FX[fxI];return (f.r||1)*Math.pow(2,(+$("tone").value)/12);}
+
+function setFx(i){
+  fxI=i;
+  [].forEach.call($("fx").children,function(e,j){e.classList.toggle("sel",j===i);});
+  if(!ctx)return;
+  var f=FX[i],t=ctx.currentTime,old=cur;
+  reg=[];
+  var w=ctx.createGain(),o=ctx.createGain();o.gain.value=0;
+  pitchOut.connect(w);
+  f.build(ctx,w).connect(o);o.connect(master);
+  o.gain.setTargetAtTime(1,t,0.015);
+  if(old){
+    old.o.gain.setTargetAtTime(0,t,0.015);
+    setTimeout(function(){
+      old.reg.forEach(function(x){try{x.stop();}catch(e){}});
+      try{pitchOut.disconnect(old.w);}catch(e){}
+      try{old.o.disconnect();}catch(e){}
+    },700);
+  }
+  cur={w:w,o:o,reg:reg};
+  setPitch(ratioNow(),f.mod);
+  info();
+}
+function info(){
+  if(!ctx)return;
+  var base=((ctx.baseLatency||0)+(ctx.outputLatency||0))*1000, f=FX[fxI];
+  var pitched=Math.abs(ratioNow()-1)>=0.002||f.mod;
+  $("info").textContent="Latenza stimata: circa "+Math.round(base+(pitched?T*500:0))+" ms"+(pitched?" (inclusi i cambi di tono)":"")+". Il microfono può aggiungerne un po’.";
+}
+
+function meter(){
+  var d=new Uint8Array(ana.fftSize);
+  (function loop(){
+    if(!live)return;
+    ana.getByteTimeDomainData(d);var s=0;for(var i=0;i<d.length;i++){var v=(d[i]-128)/128;s+=v*v;}
+    $("bar").style.width=Math.min(100,Math.sqrt(s/d.length)*260)+"%";
+    raf=requestAnimationFrame(loop);
+  })();
+}
+async function start(){
+  if(!AC||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){msg("Il microfono non è supportato in questo browser.");return;}
+  try{ctx=new AC({latencyHint:0});}catch(e){ctx=new AC();}
+  ctx.resume();
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1,latency:0}});
+  }catch(e){
+    msg("Microfono non disponibile o non autorizzato. Prova ad aprire la pagina da un indirizzo https oppure dal browser invece che da un’app.");
+    ctx.close();ctx=null;return;
+  }
+  mic=ctx.createMediaStreamSource(stream);
+  ana=ctx.createAnalyser();ana.fftSize=512;
+  var comp=ctx.createDynamicsCompressor();
+  master=ctx.createGain();master.gain.value=+$("vol").value;master.connect(comp);comp.connect(ctx.destination);
+  buildPitch();
+  var hp=filt(ctx,"highpass",80);
+  mic.connect(hp);hp.connect(pitchIn);mic.connect(ana);
+  cur=null;setFx(fxI);
+  live=true;$("go").textContent="Ferma";$("go").classList.add("live");msg("In diretta: parla!");meter();
+}
+function stop(){
+  live=false;cancelAnimationFrame(raf);$("bar").style.width="0";
+  if(stream){stream.getTracks().forEach(function(t){t.stop();});stream=null;}
+  if(ctx){ctx.close();ctx=null;}
+  cur=null;$("go").textContent="Avvia microfono";$("go").classList.remove("live");msg("");
+  $("info").textContent="Usa le cuffie, meglio se con filo: senza cuffie si crea fischio e con il Bluetooth la latenza aumenta.";
+}
+$("go").addEventListener("click",function(){if(live)stop();else start();});
+
+FX.forEach(function(f,i){
+  var b=document.createElement("button");b.type="button";b.className="fx"+(i===0?" sel":"");b.innerHTML="<i>"+f.e+"</i>"+f.n;
+  b.addEventListener("click",function(){setFx(i);});$("fx").appendChild(b);
+});
+$("tone").addEventListener("input",function(){$("toneO").textContent=this.value;if(ctx){setPitch(ratioNow(),FX[fxI].mod);info();}});
+$("vol").addEventListener("input",function(){$("volO").textContent=(+this.value).toFixed(1);if(master)master.gain.value=+this.value;});
+})();
+</script>
+</body>
+</html>

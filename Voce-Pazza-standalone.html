@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#16112e">
+<title>Voce Pazza</title>
+<style>
+:root{
+  --bg:#16112e; --card:#241c47; --ink:#f4f0ff; --mute:#a99fd0;
+  --pink:#ff4fa3; --lime:#c6ff3d; --cyan:#3de6ff; --on:#16112e;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f3efff; --card:#e2daf8; --ink:#241c47; --mute:#5f548c; --pink:#d81b7a; --lime:#4c8a00; --cyan:#0a86a0; --on:#fff; }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS","Segoe UI",Roboto,sans-serif;
+  -webkit-user-select:none;user-select:none}
+body{max-width:560px;margin:0 auto;padding:14px 14px 28px}
+h1{margin:4px 0 14px;font-size:26px;font-weight:800;text-align:center;letter-spacing:.3px}
+h1 span{color:var(--pink)}
+#recWrap{display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:16px}
+#rec{width:112px;height:112px;border-radius:50%;border:0;background:var(--pink);color:var(--on);
+  font-weight:800;font-size:15px;box-shadow:0 0 0 8px rgba(255,79,163,.2)}
+#rec.live{background:var(--lime);animation:pulse 1s infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 18px rgba(198,255,61,.12)}}
+@media (prefers-reduced-motion: reduce){#rec.live{animation:none}}
+#time{font-size:22px;font-variant-numeric:tabular-nums;color:var(--mute);min-height:28px}
+#msg{min-height:34px;text-align:center;font-size:14px;color:var(--cyan);padding:0 6px}
+.link{background:none;border:0;color:var(--cyan);font-size:14px;text-decoration:underline;padding:6px}
+#fxBox{display:none}
+#fxBox.on{display:block}
+h2{font-size:15px;margin:14px 2px 8px;color:var(--mute);font-weight:700}
+#fx{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.fx{background:var(--card);color:var(--ink);border:2px solid transparent;border-radius:14px;padding:12px 4px;
+  font:inherit;font-size:13px;font-weight:700;display:flex;flex-direction:column;align-items:center;gap:4px}
+.fx i{font-style:normal;font-size:26px;line-height:1}
+.fx.sel{border-color:var(--lime)}
+.fx:active{filter:brightness(1.25)}
+.tone{display:grid;grid-template-columns:70px 1fr 52px;align-items:center;gap:8px;font-size:13px;color:var(--mute);margin-top:6px}
+.tone output{text-align:right;color:var(--lime)}
+input[type=range]{width:100%;height:30px;accent-color:var(--pink)}
+#acts{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+#acts button{font:inherit;font-weight:800;font-size:15px;border:0;border-radius:12px;padding:14px;background:var(--card);color:var(--ink)}
+#play{background:var(--cyan)!important;color:var(--on)!important;grid-column:1 / 3}
+#acts button:disabled{opacity:.4}
+input[type=file]{display:none}
+</style>
+</head>
+<body>
+<h1>Voce <span>Pazza</span></h1>
+
+<div id="recWrap">
+  <button id="rec" type="button">Registra</button>
+  <div id="time">0:00</div>
+  <button id="loadBtn" class="link" type="button">Carica audio</button>
+  <input id="file" type="file" accept="audio/*">
+</div>
+<div id="msg" aria-live="polite">Tocca il cerchio e parla. Massimo 60 secondi.</div>
+
+<div id="fxBox">
+  <h2>Scegli un effetto</h2>
+  <div id="fx"></div>
+  <div class="tone"><label for="tone">Tono</label><input id="tone" type="range" min="-12" max="12" step="1" value="0"><output id="toneO">0</output></div>
+  <div id="acts">
+    <button id="play" type="button" disabled>Riproduci</button>
+    <button id="save" type="button" disabled>Salva</button>
+    <button id="share" type="button" disabled>Condividi</button>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+var AC=window.AudioContext||window.webkitAudioContext, OAC=window.OfflineAudioContext||window.webkitOfflineAudioContext;
+var $=function(id){return document.getElementById(id);};
+var actx=null, base=null, revBuf=null, cur=null, outBuf=null, playing=null;
+var mr=null, chunks=[], stream=null, t0=0, tInt=null, MAX=60;
+
+function msg(t){$("msg").textContent=t;}
+function ensure(){if(!actx)actx=new AC();if(actx.state!=="running")actx.resume();}
+
+// Helpers per gli effetti
+function curve(k){var n=256,a=new Float32Array(n);for(var i=0;i<n;i++){var x=i*2/n-1;a[i]=(1+k)*x/(1+k*Math.abs(x));}return a;}
+function impulse(c,sec,pw){var n=Math.floor(c.sampleRate*sec),b=c.createBuffer(2,n,c.sampleRate);
+  for(var ch=0;ch<2;ch++){var d=b.getChannelData(ch);for(var i=0;i<n;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/n,pw);}return b;}
+function filt(c,type,f,q){var b=c.createBiquadFilter();b.type=type;b.frequency.value=f;if(q)b.Q.value=q;return b;}
+function lfo(c,rate,depth,target,type){var o=c.createOscillator(),g=c.createGain();o.type=type||"sine";o.frequency.value=rate;g.gain.value=depth;o.connect(g);g.connect(target);o.start();}
+function vibrato(c,n,rate,depth,baseT){var d=c.createDelay(1);d.delayTime.value=baseT;lfo(c,rate,depth,d.delayTime);n.connect(d);return d;}
+function echo(c,n,time,fb,wet){var sum=c.createGain(),d=c.createDelay(2),f=c.createGain(),w=c.createGain();
+  d.delayTime.value=time;f.gain.value=fb;w.gain.value=wet;n.connect(sum);n.connect(d);d.connect(f);f.connect(d);d.connect(w);w.connect(sum);return sum;}
+function ring(c,n,freq,type){var g=c.createGain();g.gain.value=0;var o=c.createOscillator();o.type=type||"sine";o.frequency.value=freq;o.connect(g.gain);o.start();n.connect(g);return g;}
+function shaper(c,n,k){var w=c.createWaveShaper();w.curve=curve(k);n.connect(w);return w;}
+function chain(a,b){a.connect(b);return b;}
+
+var FX=[
+ {n:"Originale",e:"🎤",build:function(c,s){return s;}},
+ {n:"Scoiattolo",e:"🐿️",rate:1.75,build:function(c,s){return s;}},
+ {n:"Mostro",e:"👹",rate:0.62,build:function(c,s){var g=c.createGain();g.gain.value=1.4;return chain(shaper(c,chain(s,filt(c,"lowpass",3000)),6),g);}},
+ {n:"Robot",e:"🤖",build:function(c,s){return ring(c,s,60);}},
+ {n:"Alieno",e:"👽",tail:0.3,build:function(c,s){return vibrato(c,ring(c,s,190),9,0.004,0.01);}},
+ {n:"Eco",e:"🏔️",tail:3,build:function(c,s){return echo(c,s,0.28,0.5,0.7);}},
+ {n:"Caverna",e:"🕳️",tail:3.2,build:function(c,s){var sum=c.createGain(),cv=c.createConvolver(),w=c.createGain();cv.buffer=impulse(c,3,2.5);w.gain.value=0.9;
+   s.connect(sum);s.connect(cv);cv.connect(w);w.connect(sum);return sum;}},
+ {n:"Telefono",e:"📞",build:function(c,s){var g=c.createGain();g.gain.value=1.6;return chain(shaper(c,chain(chain(s,filt(c,"highpass",500)),filt(c,"lowpass",3200)),3),g);}},
+ {n:"Megafono",e:"📢",tail:0.8,build:function(c,s){var g=c.createGain();g.gain.value=1.3;
+   return echo(c,chain(shaper(c,chain(chain(s,filt(c,"highpass",700)),filt(c,"lowpass",3500)),12),g),0.09,0.3,0.4);}},
+ {n:"Sott’acqua",e:"🫧",tail:0.3,build:function(c,s){var g=c.createGain();g.gain.value=1.8;return chain(vibrato(c,chain(s,filt(c,"lowpass",650,2)),3.5,0.006,0.012),g);}},
+ {n:"Ubriaco",e:"🥴",rate:0.9,build:function(c,s){lfo(c,1.3,260,s.detune);return s;}},
+ {n:"Tremante",e:"😱",build:function(c,s){var g=c.createGain();g.gain.value=0.5;lfo(c,11,0.5,g.gain);s.connect(g);return g;}},
+ {n:"Al contrario",e:"⏪",rev:true,build:function(c,s){return s;}}
+];
+
+function reversed(){
+  if(revBuf)return revBuf;
+  var b=actx.createBuffer(base.numberOfChannels,base.length,base.sampleRate);
+  for(var ch=0;ch<base.numberOfChannels;ch++){var s=base.getChannelData(ch),d=b.getChannelData(ch);for(var i=0,n=s.length;i<n;i++)d[i]=s[n-1-i];}
+  return (revBuf=b);
+}
+function rendering(oc){return new Promise(function(res,rej){var p=oc.startRendering();if(p&&p.then)p.then(res,rej);else oc.oncomplete=function(e){res(e.renderedBuffer);};});}
+function normalize(b){
+  var d=b.getChannelData(0),pk=0,i;for(i=0;i<d.length;i++){var a=Math.abs(d[i]);if(a>pk)pk=a;}
+  if(pk<0.001)return;var k=Math.min(0.95/pk,6);for(i=0;i<d.length;i++)d[i]*=k;
+}
+async function render(fx){
+  var semis=+$("tone").value, rate=(fx.rate||1)*Math.pow(2,semis/12), src=fx.rev?reversed():base;
+  var sr=44100, len=Math.ceil((src.duration/rate+(fx.tail||0.1))*sr);
+  var oc=new OAC(1,len,sr), s=oc.createBufferSource();
+  s.buffer=src;s.playbackRate.value=rate;
+  var out=fx.build(oc,s);out.connect(oc.destination);s.start();
+  var b=await rendering(oc);normalize(b);return b;
+}
+
+// Riproduzione
+function stopPlay(){if(playing){try{playing.onended=null;playing.stop();}catch(e){}playing=null;}$("play").textContent="Riproduci";}
+function playOut(){
+  ensure();stopPlay();if(!outBuf)return;
+  var s=actx.createBufferSource();s.buffer=outBuf;s.connect(actx.destination);
+  s.onended=function(){if(playing===s){playing=null;$("play").textContent="Riproduci";}};
+  s.start();playing=s;$("play").textContent="Ferma";
+}
+$("play").addEventListener("click",function(){if(playing)stopPlay();else playOut();});
+
+async function pick(i){
+  if(!base)return;ensure();stopPlay();cur=i;
+  [].forEach.call($("fx").children,function(e,j){e.classList.toggle("sel",j===i);});
+  msg("Elaboro…");
+  try{outBuf=await render(FX[i]);}catch(e){msg("Non riesco ad applicare questo effetto.");return;}
+  ["play","save","share"].forEach(function(id){$(id).disabled=false;});
+  msg(FX[i].n+": ecco il risultato.");playOut();
+}
+FX.forEach(function(f,i){
+  var b=document.createElement("button");b.type="button";b.className="fx";b.innerHTML="<i>"+f.e+"</i>"+f.n;
+  b.addEventListener("click",function(){pick(i);});$("fx").appendChild(b);
+});
+$("tone").addEventListener("input",function(){$("toneO").textContent=this.value;});
+$("tone").addEventListener("change",function(){if(cur!==null)pick(cur);});
+
+// WAV
+function wav(b){
+  var d=b.getChannelData(0),n=d.length,buf=new ArrayBuffer(44+n*2),v=new DataView(buf),i;
+  function str(o,t){for(var k=0;k<t.length;k++)v.setUint8(o+k,t.charCodeAt(k));}
+  str(0,"RIFF");v.setUint32(4,36+n*2,true);str(8,"WAVE");str(12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);
+  v.setUint32(24,b.sampleRate,true);v.setUint32(28,b.sampleRate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);str(36,"data");v.setUint32(40,n*2,true);
+  for(i=0;i<n;i++){var x=Math.max(-1,Math.min(1,d[i]));v.setInt16(44+i*2,x<0?x*0x8000:x*0x7fff,true);}
+  return new Blob([buf],{type:"audio/wav"});
+}
+function fname(){return "voce-"+FX[cur].n.toLowerCase().replace(/[^a-z]+/g,"-")+".wav";}
+$("save").addEventListener("click",function(){
+  if(!outBuf)return;var u=URL.createObjectURL(wav(outBuf)),a=document.createElement("a");
+  a.href=u;a.download=fname();document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(u);},4000);
+  msg("Se non parte il download, usa Condividi.");
+});
+$("share").addEventListener("click",async function(){
+  if(!outBuf)return;var f=new File([wav(outBuf)],fname(),{type:"audio/wav"});
+  if(navigator.canShare&&navigator.canShare({files:[f]})){try{await navigator.share({files:[f],title:"Voce Pazza"});}catch(e){}}
+  else msg("Condivisione non disponibile qui: usa Salva.");
+});
+
+// Registrazione
+function decode(ab){return new Promise(function(res,rej){var p=actx.decodeAudioData(ab,res,rej);if(p&&p.catch)p.catch(rej);});}
+function setBase(buf){
+  if(buf.duration>90){msg("Audio troppo lungo: massimo 90 secondi.");return;}
+  base=buf;revBuf=null;outBuf=null;cur=null;stopPlay();
+  ["play","save","share"].forEach(function(id){$(id).disabled=true;});
+  [].forEach.call($("fx").children,function(e){e.classList.remove("sel");});
+  $("fxBox").classList.add("on");$("time").textContent=Math.round(buf.duration*10)/10+" s";
+  msg("Registrazione pronta. Scegli un effetto.");
+}
+async function loadBlob(blob){
+  try{setBase(await decode(await blob.arrayBuffer()));}
+  catch(e){msg("Audio non leggibile. Prova a registrare di nuovo o a caricare un file WAV, MP3 o M4A.");}
+}
+function fmt(s){return Math.floor(s/60)+":"+("0"+Math.floor(s%60)).slice(-2);}
+function endRec(){
+  clearInterval(tInt);$("rec").classList.remove("live");$("rec").textContent="Registra";
+  if(stream){stream.getTracks().forEach(function(t){t.stop();});stream=null;}
+}
+async function startRec(){
+  ensure();stopPlay();
+  if(!window.MediaRecorder||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){msg("Registrazione non supportata qui. Usa “Carica audio”.");return;}
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:true});}
+  catch(e){msg("Microfono non disponibile o non autorizzato. Usa “Carica audio” per registrare con l’app del telefono.");return;}
+  var mt=["audio/webm;codecs=opus","audio/mp4","audio/webm","audio/ogg"].filter(function(t){return MediaRecorder.isTypeSupported(t);})[0];
+  mr=new MediaRecorder(stream,mt?{mimeType:mt}:undefined);chunks=[];
+  mr.ondataavailable=function(e){if(e.data&&e.data.size)chunks.push(e.data);};
+  mr.onstop=function(){var type=mr.mimeType||"audio/webm";endRec();loadBlob(new Blob(chunks,{type:type}));};
+  mr.start();t0=Date.now();$("rec").classList.add("live");$("rec").textContent="Stop";msg("Sto registrando…");
+  tInt=setInterval(function(){var s=(Date.now()-t0)/1000;$("time").textContent=fmt(s);if(s>=MAX&&mr.state==="recording")mr.stop();},200);
+}
+$("rec").addEventListener("click",function(){
+  if(mr&&mr.state==="recording")mr.stop();else startRec();
+});
+$("loadBtn").addEventListener("click",function(){$("file").click();});
+$("file").addEventListener("change",function(){
+  var f=this.files[0];if(!f)return;ensure();msg("Carico l’audio…");loadBlob(f);this.value="";
+});
+})();
+</script>
+</body>
+</html>
